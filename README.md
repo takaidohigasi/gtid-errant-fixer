@@ -8,27 +8,34 @@ Please see also the detail on the Percona Live [slide](https://www.percona.com/l
 ## usage
 
 ```
-Usage of ./bin/gtid-errant-fixer:
-  -c string mysql client config (default ".my.cnf")
-  -f        force execution
+$ ./gtid-errant-fixer --help
+Usage of ./gtid-errant-fixer:
+  -c string
+        mysql client config(need SUPER priv to operate stop / slave) (default ".my.cnf")
+  -f    force execution (skip prompt to confirm Y/N
+  -p string
+        mysql client config (need REPLICATION SLAVE)
+  -u string
+        mysql client config (need REPLICATION SLAVE)
 ```
 
 ## example
 
+you can reset errant_gtid which you can confirm with server_id and host (report_host is required to enable)
+
 ```
-% ./bin/gtid-errant-fixer                                                                                                                 main
-errant transaction pre-check: 
-  errant transaction found: 211f4d80-914c-11eb-b1ec-0242ac1f0004:1
+$ ./gtid-errant-fixer
+errant transaction pre-check:
+ errant_gtid ea2c5164-930b-11eb-901c-0242c0a81004:1: server_id: 3, host mysql3
 stopping replica
-original gtid_executed: 
-0a59fb94-914c-11eb-8644-0242ac1f0002:1-4,
-0a66ee4a-914c-11eb-b206-0242ac1f0003:1-7,
-211f4d80-914c-11eb-b1ec-0242ac1f0004:1
-remove 211f4d80-914c-11eb-b1ec-0242ac1f0004:1 from gtid_executed
+original gtid_executed:
+e9f7ad21-930b-11eb-8646-0242c0a81002:1-18,
+ea052114-930b-11eb-8dd3-0242c0a81003:1-18,
+ea2c5164-930b-11eb-901c-0242c0a81004:1
 would you continue to reset? (y/n) [n]: y
 RESET SLAVE
 RESET MASTER
-SET GLOBAL gtid_purged='0a59fb94-914c-11eb-8644-0242ac1f0002:1-4,0a66ee4a-914c-11eb-b206-0242ac1f0003:1-7'
+SET GLOBAL gtid_purged='e9f7ad21-930b-11eb-8646-0242c0a81002:1-18,ea052114-930b-11eb-8dd3-0242c0a81003:1-18'
 resuming replica
 completed.
 ```
