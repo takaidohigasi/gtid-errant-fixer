@@ -16,25 +16,29 @@ func exitWithError(err error) {
 }
 
 func main() {
-	var conf string
+	var conf, monitorUser, monitorPass string
 	var forceOption bool
 
-	flag.StringVar(&conf, "c", ".my.cnf", "mysql client config")
-	flag.BoolVar(&forceOption, "f", false, "force execution")
+	flag.StringVar(&conf, "c", ".my.cnf", "mysql client config(need SUPER priv to operate stop / slave)")
+	flag.StringVar(&monitorUser, "u", "root", "mysql client config ()")
+	flag.StringVar(&monitorPass, "p", "", "mysql client config ()")
+	flag.BoolVar(&forceOption, "f", false, "force execution (skip prompt to confirm Y/N")
 	flag.Parse()
 
-	_, err := os.Stat(conf)
-	if err != nil {
+	if _, err := os.Stat(conf); err != nil {
 		exitWithError(err)
 	}
-
 	db, err := mysql_defaults_file.OpenUsingDefaultsFile("mysql", conf, "")
 	if err != nil {
 		exitWithError(err)
 	}
 	defer db.Close()
 
-	mysqlDB := replica.MySQLDB{db, nil, ""}
+	mysqlDB, err := replica.NewMySQLDB(db, monitorUser, monitorPass)
+	if err != nil {
+		exitWithError(err)
+	}
+
 	if err := mysqlDB.FixErrantGTID(forceOption); err != nil {
 		exitWithError(err)
 	}

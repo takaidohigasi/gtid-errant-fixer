@@ -16,6 +16,7 @@ type (
 		AutoPosition      bool   `db:"Auto_Position"`
 		ChannelName       string `db:"Channel_Name"`
 		ExecutedGtidSet   string `db:"Executed_Gtid_Set"`
+		GtidExecuted      string // @@gtid_executed
 		MasterHost        string `db:"Master_Host"`
 		MasterUUID        string `db:"Master_UUID"`
 		ReplicaIORunning  string `db:"Slave_IO_Running"`
@@ -23,39 +24,59 @@ type (
 	}
 
 	MySQLDB struct {
-		Dbh        *sql.DB
-		ReplStatus []ReplicaStatus
-		ServerUuid string
+		dbh         *sql.DB
+		replStatus  []ReplicaStatus
+		serverUuid  string
+		monitorUser string
+		monitorPass string
+		serverHosts map[string]*MySQLServerInfo
+	}
+
+	MySQLServerInfo struct {
+		ServerId   int    `db:"Server_id"`
+		Host       string `db:"Host"`
+		ServerUuid string `db:"Slave_UUID"`
 	}
 )
 
 const (
-	replicaStatusQuery = `SHOW SLAVE STATUS`
-	stopReplicaQuery   = `STOP SLAVE`
-	startReplicaQuery  = `START SLAVE`
-	resetReplicaQuery  = `RESET SLAVE`
-	resetMasterQuery   = `RESET MASTER`
-	setGtidPurgedQuery = `SET GLOBAL gtid_purged='%s'`
-	getServerUuidQuery = `SELECT @@server_uuid`
+	resetMasterQuery     = `RESET MASTER`
+	resetReplicaQuery    = `RESET SLAVE`
+	getserverUuidQuery   = `SELECT @@server_uuid`
+	getGTIDExecutedQuery = `SELECT @@global.gtid_executed`
+	// see https://dev.mysql.com/doc/refman/5.7/en/gtid-functions.html
+	getErrantGTIDsQuery  = `SELECT GTID_SUBTRACT('%s', '%s')`
+	setGtidPurgedQuery   = `SET GLOBAL gtid_purged='%s'`
+	replicaStatusQuery   = `SHOW SLAVE STATUS`
+	showReplicaHostQuery = `SHOW SLAVE HOSTS`
+	startReplicaQuery    = `START SLAVE`
+	stopReplicaQuery     = `STOP SLAVE`
 )
 
-// gatherReplicaStatuses update ReplStatus of MySQLDB
+func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, error) {
+	var serverUuid string
+	if err := db.QueryRow(getserverUuidQuery).Scan(&serverUuid); err != nil {
+		return nil, err
+	}
+	return &MySQLDB{db, nil, serverUuid, monitorUser, monitorPass, map[string]*MySQLServerInfo{}}, nil
+}
+
+// gatherReplicaStatuses update replStatus of MySQLDB
 func (db *MySQLDB) gatherReplicaStatuses() error {
-	sqlxDb := sqlx.NewDb(db.Dbh, "mysql")
+	sqlxDb := sqlx.NewDb(db.dbh, "mysql")
 
 	rows, err := sqlxDb.Unsafe().Queryx(replicaStatusQuery)
 	if err != nil {
 		return err
 	}
 
-	db.ReplStatus = nil
+	db.replStatus = nil
 	status := &ReplicaStatus{}
 	for rows.Next() {
-		err = rows.StructScan(status)
-		if err != nil {
+		if err = rows.StructScan(status); err != nil {
 			return err
 		}
-		db.ReplStatus = append(db.ReplStatus, *status)
+		db.replStatus = append(db.replStatus, *status)
 	}
 
 	return nil
@@ -63,7 +84,7 @@ func (db *MySQLDB) gatherReplicaStatuses() error {
 
 // function autoPosition check whether auto position is enabled for all the channel
 func (db *MySQLDB) autoPosition() bool {
-	for _, status := range db.ReplStatus {
+	for _, status := range db.replStatus {
 		if !status.AutoPosition {
 			return false
 		}
@@ -72,7 +93,7 @@ func (db *MySQLDB) autoPosition() bool {
 }
 
 func (db *MySQLDB) replicaStopped() bool {
-	for _, status := range db.ReplStatus {
+	for _, status := range db.replStatus {
 		if !(status.ReplicaIORunning == "No" && status.ReplicaSQLRunning != "No") {
 			fmt.Printf("SlaveIORunning: %s, SlaveSQLRunning: %s (channel: %s)", status.ReplicaIORunning, status.ReplicaSQLRunning, status.ChannelName)
 			return false
@@ -83,7 +104,7 @@ func (db *MySQLDB) replicaStopped() bool {
 
 func (db *MySQLDB) stopReplica() error {
 	fmt.Println("stopping replica")
-	if _, err := db.Dbh.Exec(stopReplicaQuery); err != nil {
+	if _, err := db.dbh.Exec(stopReplicaQuery); err != nil {
 		return err
 	}
 
@@ -92,32 +113,61 @@ func (db *MySQLDB) stopReplica() error {
 
 func (db *MySQLDB) resumeReplica() error {
 	fmt.Println("resuming replica")
-	if _, err := db.Dbh.Exec(startReplicaQuery); err != nil {
+	if _, err := db.dbh.Exec(startReplicaQuery); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (db *MySQLDB) errantTransaction() bool {
+func (db *MySQLDB) errantTransaction() (string, error) {
 	fmt.Println("errant transaction pre-check: ")
 
-	// warning: this is not strict check.
-	for _, gtid := range strings.Split(db.ReplStatus[0].ExecutedGtidSet, ",") {
-		gtid = strings.Trim(gtid, "\n")
-		if strings.HasPrefix(gtid, db.ServerUuid) {
-			fmt.Printf("  errant transaction found: %s\n", gtid)
-			// TODO: print binlog events
-			return true
+	var errantGtidSets string
+	var executedGtidSets []string
+	for _, replica := range db.replStatus {
+		// connect to maser
+		dsn := db.monitorUser + ":" + db.monitorPass + "@(" + replica.MasterHost + ")/"
+		sqlxdb, err := sqlx.Open("mysql", dsn)
+		if err != nil {
+			return errantGtidSets, err
+		}
+		defer sqlxdb.Close()
+
+		// replication node info
+		rows, err := sqlxdb.Unsafe().Queryx(showReplicaHostQuery)
+		if err != nil {
+			return errantGtidSets, err
+		}
+		server := &MySQLServerInfo{}
+		for rows.Next() {
+			if err = rows.StructScan(server); err != nil {
+				return errantGtidSets, err
+			}
+			db.serverHosts[server.ServerUuid] = server
+		}
+
+		// gtid_executed
+		if err := sqlxdb.QueryRowx(getGTIDExecutedQuery).Scan(&replica.GtidExecuted); err != nil {
+			return errantGtidSets, err
+		}
+		executedGtidSets = append(executedGtidSets, replica.GtidExecuted)
+	}
+
+	replicaGtidSets := strings.Replace(db.replStatus[0].ExecutedGtidSet, "\n", "", -1)
+	masterGtidSets := strings.Join(executedGtidSets, ",")
+	sqlxdb := sqlx.NewDb(db.dbh, "mysql")
+	if err := sqlxdb.QueryRowx(fmt.Sprintf(getErrantGTIDsQuery, replicaGtidSets, masterGtidSets)).Scan(&errantGtidSets); err != nil {
+		return errantGtidSets, err
+	}
+
+	if errantGtidSets != "" {
+		for _, errant := range strings.Split(errantGtidSets, ",") {
+			host := db.serverHosts[strings.Split(errant, ":")[0]]
+			fmt.Printf(" errant_gtid %s: server_id: %d, host %s\n", errant, host.ServerId, host.Host)
 		}
 	}
-	fmt.Println("  no errant transaction\n")
-	db.printGTIDSet()
-	return false
-}
 
-func (db *MySQLDB) printGTIDSet() {
-	fmt.Println("server_uuid: " + db.ServerUuid)
-	fmt.Println("gtid_executed: \n" + db.ReplStatus[0].ExecutedGtidSet)
+	return errantGtidSets, nil
 }
 
 func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
@@ -129,12 +179,13 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 		return errors.New("auto position must be enabled for all the channel")
 	}
 
-	if err := db.Dbh.QueryRow(getServerUuidQuery).Scan(&db.ServerUuid); err != nil {
+	if err := db.dbh.QueryRow(getserverUuidQuery).Scan(&db.serverUuid); err != nil {
 		return err
 	}
 
-	if !db.errantTransaction() {
-		return nil
+	errantGtidSets, err := db.errantTransaction()
+	if err != nil {
+		return err
 	}
 
 	if err := db.stopReplica(); err != nil {
@@ -146,39 +197,41 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 		return err
 	}
 
-	executedGtidSet := db.ReplStatus[0].ExecutedGtidSet
+	// print original state just in case
+	executedGtidSet := db.replStatus[0].ExecutedGtidSet
 	fmt.Printf("original gtid_executed: \n%s\n", executedGtidSet)
-
 	gtidSet := strings.Split(executedGtidSet, ",")
 
 	var gtidPurged []string
 	for _, gtid := range gtidSet {
-		gtid = strings.Trim(gtid, "\n")
-		if !strings.HasPrefix(gtid, db.ServerUuid) {
-			gtidPurged = append(gtidPurged, gtid)
-		} else {
-			fmt.Printf("remove %s from gtid_executed\n", gtid)
+		gtid = strings.Replace(gtid, "\n", "", -1)
+		for _, errant := range strings.Split(errantGtidSets, ",") {
+			if strings.HasPrefix(gtid, strings.Split(errant, ":")[0]) {
+				continue
+			}
 		}
+		gtidPurged = append(gtidPurged, gtid)
 	}
 
 	if !forceOption {
 		if !prompter.YN("would you continue to reset?", false) {
-			fmt.Println("do nothing")
-			return nil
+			if !prompter.YN("would you continue to reset?", false) {
+				fmt.Println("do nothing")
+				return nil
+			}
+		}
+		fmt.Println(resetReplicaQuery)
+		if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
+			return err
+		}
+		fmt.Println(resetMasterQuery)
+		if _, err := db.dbh.Exec(resetMasterQuery); err != nil {
+			return err
+		}
+		fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
+		if _, err := db.dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
+			return err
 		}
 	}
-	fmt.Println(resetReplicaQuery)
-	if _, err := db.Dbh.Exec(resetReplicaQuery); err != nil {
-		return err
-	}
-	fmt.Println(resetMasterQuery)
-	if _, err := db.Dbh.Exec(resetMasterQuery); err != nil {
-		return err
-	}
-	fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
-	if _, err := db.Dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
-		return err
-	}
-
 	return nil
 }
