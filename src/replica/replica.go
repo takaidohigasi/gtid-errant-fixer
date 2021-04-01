@@ -4,11 +4,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	_ "github.com/go-sql-driver/mysql"
+	"strings"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/Songmu/prompter"
+	"github.com/jmoiron/sqlx"
 )
 
 type (
@@ -30,13 +30,13 @@ type (
 )
 
 const (
-	replicaStatusQuery   = `SHOW SLAVE STATUS`
-	stopReplicaQuery     = `STOP SLAVE`
-	startReplicaQuery    = `START SLAVE`
-	resetReplicaQuery    = `RESET SLAVE`
-	resetMasterQuery     = `RESET MASTER`
-	setGtidPurgedQuery   = `SET GLOBAL gtid_purged='%s'`
-	getServerUuidQuery   = `SELECT @@server_uuid`
+	replicaStatusQuery = `SHOW SLAVE STATUS`
+	stopReplicaQuery   = `STOP SLAVE`
+	startReplicaQuery  = `START SLAVE`
+	resetReplicaQuery  = `RESET SLAVE`
+	resetMasterQuery   = `RESET MASTER`
+	setGtidPurgedQuery = `SET GLOBAL gtid_purged='%s'`
+	getServerUuidQuery = `SELECT @@server_uuid`
 )
 
 // gatherReplicaStatuses update ReplStatus of MySQLDB
@@ -83,7 +83,7 @@ func (db *MySQLDB) replicaStopped() bool {
 
 func (db *MySQLDB) stopReplica() error {
 	fmt.Println("stopping replica")
-    if _, err := db.Dbh.Exec(stopReplicaQuery); err !=nil {
+	if _, err := db.Dbh.Exec(stopReplicaQuery); err != nil {
 		return err
 	}
 
@@ -92,25 +92,32 @@ func (db *MySQLDB) stopReplica() error {
 
 func (db *MySQLDB) resumeReplica() error {
 	fmt.Println("resuming replica")
-	if _, err := db.Dbh.Exec(startReplicaQuery); err !=nil {
+	if _, err := db.Dbh.Exec(startReplicaQuery); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (db *MySQLDB) errantTransaction() (bool) {
-	fmt.Print("errant transaction pre-check: ")
+func (db *MySQLDB) errantTransaction() bool {
+	fmt.Println("errant transaction pre-check: ")
 
 	// warning: this is not strict check.
 	for _, gtid := range strings.Split(db.ReplStatus[0].ExecutedGtidSet, ",") {
-		if strings.HasPrefix(strings.Trim(gtid, "\n"), db.ServerUuid) {
-			fmt.Printf("errant transaction found: %s\n", gtid)
+		gtid = strings.Trim(gtid, "\n")
+		if strings.HasPrefix(gtid, db.ServerUuid) {
+			fmt.Printf("  errant transaction found: %s\n", gtid)
 			// TODO: print binlog events
 			return true
 		}
 	}
-	fmt.Println("no errant transaction")
+	fmt.Println("  no errant transaction\n")
+	db.printGTIDSet()
 	return false
+}
+
+func (db *MySQLDB) printGTIDSet() {
+	fmt.Println("server_uuid: " + db.ServerUuid)
+	fmt.Println("gtid_executed: \n" + db.ReplStatus[0].ExecutedGtidSet)
 }
 
 func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
@@ -125,10 +132,8 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 	if err := db.Dbh.QueryRow(getServerUuidQuery).Scan(&db.ServerUuid); err != nil {
 		return err
 	}
-	fmt.Printf("server_uuid: %s\n", db.ServerUuid)
 
 	if !db.errantTransaction() {
-		fmt.Println("no errant uuid.")
 		return nil
 	}
 
@@ -148,6 +153,7 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 
 	var gtidPurged []string
 	for _, gtid := range gtidSet {
+		gtid = strings.Trim(gtid, "\n")
 		if !strings.HasPrefix(gtid, db.ServerUuid) {
 			gtidPurged = append(gtidPurged, gtid)
 		} else {
@@ -156,19 +162,23 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 	}
 
 	if !forceOption {
-		if prompter.YN("would you continue to reset?", false) {
+		if !prompter.YN("would you continue to reset?", false) {
+			fmt.Println("do nothing")
 			return nil
 		}
 	}
+	fmt.Println(resetReplicaQuery)
 	if _, err := db.Dbh.Exec(resetReplicaQuery); err != nil {
-			return err
-		}
+		return err
+	}
+	fmt.Println(resetMasterQuery)
 	if _, err := db.Dbh.Exec(resetMasterQuery); err != nil {
-			return err
-		}
+		return err
+	}
+	fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
 	if _, err := db.Dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
-			return err
-		}
+		return err
+	}
 
 	return nil
 }
