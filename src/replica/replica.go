@@ -165,6 +165,7 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 
 	if errantGtidSets != "" {
 		for _, errant := range strings.Split(errantGtidSets, ",") {
+			errant = strings.Replace(errant, "\n", "", -1)
 			host := db.serverHosts[strings.Split(errant, ":")[0]]
 			fmt.Printf(" errant_gtid %s: server_id: %d, host %s\n", errant, host.ServerId, host.Host)
 		}
