@@ -221,11 +221,9 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 		}
 	}
 
-	if !forceOption {
-		if !prompter.YN("\nWould you continue to reset?", false) {
-			fmt.Println("do nothing")
-			return nil
-		}
+	if !forceOption && !prompter.YN("\nWould you continue to reset?", false) {
+		fmt.Println("do nothing")
+		return nil
 	}
 	fmt.Println(resetReplicaQuery)
 	if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
