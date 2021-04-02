@@ -170,6 +170,7 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 			fmt.Printf(" errant_gtid %s: server_id: %d, host %s\n", errant, host.ServerId, host.Host)
 		}
 	}
+	fmt.Println("")
 
 	return errantGtidSets, nil
 }
@@ -221,22 +222,23 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 	}
 
 	if !forceOption {
-		if !prompter.YN("would you continue to reset?", false) {
+		if !prompter.YN("\nWould you continue to reset?", false) {
 			fmt.Println("do nothing")
 			return nil
 		}
-		fmt.Println(resetReplicaQuery)
-		if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
-			return err
-		}
-		fmt.Println(resetMasterQuery)
-		if _, err := db.dbh.Exec(resetMasterQuery); err != nil {
-			return err
-		}
-		fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
-		if _, err := db.dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
-			return err
-		}
 	}
+	fmt.Println(resetReplicaQuery)
+	if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
+		return err
+	}
+	fmt.Println(resetMasterQuery)
+	if _, err := db.dbh.Exec(resetMasterQuery); err != nil {
+		return err
+	}
+	fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
+	if _, err := db.dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
+		return err
+	}
+
 	return nil
 }
