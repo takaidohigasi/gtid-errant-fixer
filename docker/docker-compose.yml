@@ -31,11 +31,24 @@ services:
       - '3308:3306'
     depends_on:
       - mysql1
-      - mysql2
     tmpfs: /var/lib/mysql
     volumes:
       - ./mysql3.cnf:/etc/mysql/conf.d/my.cnf
       - ./init_mysql3.sh:/docker-entrypoint-initdb.d/init.sh
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: 1
+      TZ: "Asia/Tokyo"
+  mysql4:
+    image: mysql:5.7
+    ports:
+      - '3309:3306'
+    depends_on:
+      - mysql2
+      - mysql3
+    tmpfs: /var/lib/mysql
+    volumes:
+      - ./mysql4.cnf:/etc/mysql/conf.d/my.cnf
+      - ./init_mysql4.sh:/docker-entrypoint-initdb.d/init.sh
     environment:
       MYSQL_ALLOW_EMPTY_PASSWORD: 1
       TZ: "Asia/Tokyo"
