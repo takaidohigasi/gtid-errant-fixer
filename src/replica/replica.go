@@ -14,11 +14,14 @@ import (
 )
 
 type (
-	ReplicaStatus struct {
+	ReplicaNodes struct {
 		AutoPosition      bool   `db:"Auto_Position"`
 		ChannelName       string `db:"Channel_Name"`
 		ExecutedGtidSet   string `db:"Executed_Gtid_Set"`
 		GtidExecuted      string // @@gtid_executed
+		Info              MySQLServerInfo
+		Level             int
+		Source            *ReplicaNodes
 		MasterHost        string `db:"Master_Host"`
 		MasterPort        int    `db:"Master_Port"`
 		MasterUUID        string `db:"Master_UUID"`
@@ -27,12 +30,12 @@ type (
 	}
 
 	MySQLDB struct {
-		dbh         *sql.DB
-		replStatus  []ReplicaStatus
-		serverUuid  string
-		monitorUser string
-		monitorPass string
-		serverHosts map[string]MySQLServerInfo
+		dbh             *sql.DB
+		executedGtidSet string
+		monitorUser     string
+		monitorPass     string
+		replicaNodes    map[string]ReplicaNodes
+		serverUuid      string
 	}
 
 	MySQLServerInfo struct {
@@ -43,17 +46,17 @@ type (
 )
 
 const (
-	resetMasterQuery     = `RESET MASTER`
-	resetReplicaQuery    = `RESET SLAVE`
-	getErrantGTIDsQuery  = `SELECT GTID_SUBTRACT('%s', '%s')`
-	getGTIDExecutedQuery = `SELECT @@global.gtid_executed`
-	getServerUuidQuery   = `SELECT @@server_uuid`
+	resetMasterQuery  = `RESET MASTER`
+	resetReplicaQuery = `RESET SLAVE`
 	// see https://dev.mysql.com/doc/refman/5.7/en/gtid-functions.html
-	setGtidPurgedQuery   = `SET GLOBAL gtid_purged='%s'`
-	replicaStatusQuery   = `SHOW SLAVE STATUS`
-	showReplicaHostQuery = `SHOW SLAVE HOSTS`
-	startReplicaQuery    = `START SLAVE`
-	stopReplicaQuery     = `STOP SLAVE`
+	getErrantGTIDsQuery    = `SELECT GTID_SUBTRACT('%s', '%s')`
+	getGTIDExecutedQuery   = `SELECT @@global.gtid_executed`
+	getServerUuidQuery     = `SELECT @@server_uuid`
+	setGtidPurgedQuery     = `SET GLOBAL gtid_purged='%s'`
+	showReplicaHostQuery   = `SHOW SLAVE HOSTS`
+	showReplicaStatusQuery = `SHOW SLAVE STATUS`
+	startReplicaQuery      = `START SLAVE`
+	stopReplicaQuery       = `STOP SLAVE`
 )
 
 func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, error) {
@@ -61,44 +64,66 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 	if err := db.QueryRow(getServerUuidQuery).Scan(&serverUuid); err != nil {
 		return nil, err
 	}
-	return &MySQLDB{db, nil, serverUuid, monitorUser, monitorPass, map[string]MySQLServerInfo{}}, nil
+	return &MySQLDB{
+		db,
+		"",
+		monitorUser,
+		monitorPass,
+		map[string]ReplicaNodes{},
+		serverUuid,
+	}, nil
 }
 
-// gatherReplicaStatuses update replStatus of MySQLDB
-func (db *MySQLDB) gatherReplicaStatuses() error {
-	sqlxDb := sqlx.NewDb(db.dbh, "mysql")
+func (node ReplicaNodes) searchNode(db *MySQLDB) error {
+	dsn := db.monitorUser + ":" + db.monitorPass + "@(" + node.MasterHost + ":" + strconv.Itoa(node.MasterPort) + ")/"
+	sqlxDb, err := sqlx.Open("mysql", dsn)
+	if err != nil {
+		return err
+	}
+	defer sqlxDb.Close()
 
-	rows, err := sqlxDb.Unsafe().Queryx(replicaStatusQuery)
+	rows, err := sqlxDb.Unsafe().Queryx(showReplicaStatusQuery)
 	if err != nil {
 		return err
 	}
 
-	db.replStatus = nil
-	status := &ReplicaStatus{}
+	newNode := ReplicaNodes{}
 	for rows.Next() {
-		if err = rows.StructScan(status); err != nil {
+		if err = rows.StructScan(&newNode); err != nil {
 			return err
 		}
-		db.replStatus = append(db.replStatus, *status)
+		newNode.Level = node.Level + 1
+		db.replicaNodes[newNode.MasterUUID] = newNode
 	}
+
+	return nil
+}
+// gatherReplicaNodeses update replStatus of MySQLDB
+func (db *MySQLDB) gatherReplicaStatus() error {
+	sqlxDb := sqlx.NewDb(db.dbh, "mysql")
+
+	rows, err := sqlxDb.Unsafe().Queryx(showReplicaStatusQuery)
+	if err != nil {
+		return err
+	}
+
+	node := ReplicaNodes{}
+	for rows.Next() {
+		if err = rows.StructScan(&node); err != nil {
+			return err
+		}
+		node.Level = 1
+		db.replicaNodes[node.MasterUUID] = node
+	}
+	db.executedGtidSet = node.ExecutedGtidSet
 
 	return nil
 }
 
 // function autoPosition check whether auto position is enabled for all the channel
 func (db *MySQLDB) autoPosition() bool {
-	for _, status := range db.replStatus {
-		if !status.AutoPosition {
-			return false
-		}
-	}
-	return true
-}
-
-func (db *MySQLDB) replicaStopped() bool {
-	for _, status := range db.replStatus {
-		if !(status.ReplicaIORunning == "No" && status.ReplicaSQLRunning != "No") {
-			fmt.Printf("SlaveIORunning: %s, SlaveSQLRunning: %s (channel: %s)", status.ReplicaIORunning, status.ReplicaSQLRunning, status.ChannelName)
+	for _, node := range db.replicaNodes {
+		if node.Level == 1 && !node.AutoPosition {
 			return false
 		}
 	}
@@ -127,17 +152,17 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 
 	var errantGtidSets string
 	var executedGtidSets []string
-	for _, replica := range db.replStatus {
+	for _, node := range db.replicaNodes {
 		// connect to maser
-		dsn := db.monitorUser + ":" + db.monitorPass + "@(" + replica.MasterHost + ":" + strconv.Itoa(replica.MasterPort) + ")/"
-		sqlxdb, err := sqlx.Open("mysql", dsn)
+		dsn := db.monitorUser + ":" + db.monitorPass + "@(" + node.MasterHost + ":" + strconv.Itoa(node.MasterPort) + ")/"
+		sqlxDb, err := sqlx.Open("mysql", dsn)
 		if err != nil {
 			return errantGtidSets, err
 		}
-		defer sqlxdb.Close()
+		defer sqlxDb.Close()
 
 		// replication node info
-		rows, err := sqlxdb.Unsafe().Queryx(showReplicaHostQuery)
+		rows, err := sqlxDb.Unsafe().Queryx(showReplicaHostQuery)
 		if err != nil {
 			return errantGtidSets, err
 		}
@@ -146,28 +171,29 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 			if err = rows.StructScan(&server); err != nil {
 				return errantGtidSets, err
 			}
-			db.serverHosts[server.ServerUuid] = server
+			n := db.replicaNodes[server.ServerUuid]
+			n.Info = server
 		}
 
 		// gtid_executed
-		if err := sqlxdb.QueryRowx(getGTIDExecutedQuery).Scan(&replica.GtidExecuted); err != nil {
+		if err := sqlxDb.QueryRowx(getGTIDExecutedQuery).Scan(&node.GtidExecuted); err != nil {
 			return errantGtidSets, err
 		}
-		executedGtidSets = append(executedGtidSets, replica.GtidExecuted)
+		executedGtidSets = append(executedGtidSets, node.GtidExecuted)
 	}
-
-	replicaGtidSets := strings.Replace(db.replStatus[0].ExecutedGtidSet, "\n", "", -1)
+	// TODO:
+	replicaGtidSets := strings.Replace(db.executedGtidSet, "\n", "", -1)
 	masterGtidSets := strings.Join(executedGtidSets, ",")
-	sqlxdb := sqlx.NewDb(db.dbh, "mysql")
-	if err := sqlxdb.QueryRowx(fmt.Sprintf(getErrantGTIDsQuery, replicaGtidSets, masterGtidSets)).Scan(&errantGtidSets); err != nil {
+	sqlxDb := sqlx.NewDb(db.dbh, "mysql")
+	if err := sqlxDb.QueryRowx(fmt.Sprintf(getErrantGTIDsQuery, replicaGtidSets, masterGtidSets)).Scan(&errantGtidSets); err != nil {
 		return errantGtidSets, err
 	}
 
 	if errantGtidSets != "" {
 		for _, errant := range strings.Split(errantGtidSets, ",") {
 			errant = strings.Replace(errant, "\n", "", -1)
-			host := db.serverHosts[strings.Split(errant, ":")[0]]
-			fmt.Printf(" errant_gtid %s: server_id: %d, host %s\n", errant, host.ServerId, host.Host)
+			node := db.replicaNodes[strings.Split(errant, ":")[0]]
+			fmt.Printf(" errant_gtid %s: server_id: %d, host %s\n", errant, node.Info.ServerId, node.Info.Host)
 		}
 	}
 	fmt.Println("")
@@ -176,7 +202,7 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 }
 
 func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
-	if err := db.gatherReplicaStatuses(); err != nil {
+	if err := db.gatherReplicaStatus(); err != nil {
 		return err
 	}
 
@@ -198,12 +224,12 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 	}
 	defer db.resumeReplica()
 
-	if err := db.gatherReplicaStatuses(); err != nil {
+	if err := db.gatherReplicaStatus(); err != nil {
 		return err
 	}
 
 	// print original state just in case
-	executedGtidSet := db.replStatus[0].ExecutedGtidSet
+	executedGtidSet := db.executedGtidSet
 	fmt.Printf("original gtid_executed: \n%s\n", executedGtidSet)
 	gtidSet := strings.Split(executedGtidSet, ",")
 
