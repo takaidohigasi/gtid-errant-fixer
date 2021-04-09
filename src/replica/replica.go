@@ -14,14 +14,14 @@ import (
 )
 
 type (
-	ReplicaNodes struct {
+	ReplicaNode struct {
 		AutoPosition      bool   `db:"Auto_Position"`
 		ChannelName       string `db:"Channel_Name"`
 		ExecutedGtidSet   string `db:"Executed_Gtid_Set"`
 		GtidExecuted      string // @@gtid_executed
 		Info              MySQLServerInfo
 		Level             int
-		Source            *ReplicaNodes
+		Source            *ReplicaNode
 		MasterHost        string `db:"Master_Host"`
 		MasterPort        int    `db:"Master_Port"`
 		MasterUUID        string `db:"Master_UUID"`
@@ -34,7 +34,7 @@ type (
 		executedGtidSet string
 		monitorUser     string
 		monitorPass     string
-		replicaNodes    map[string]ReplicaNodes
+		replicaNodes    map[string]ReplicaNode
 		serverUuid      string
 	}
 
@@ -69,14 +69,13 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 		"",
 		monitorUser,
 		monitorPass,
-		map[string]ReplicaNodes{},
+		map[string]ReplicaNode{},
 		serverUuid,
 	}, nil
 }
 
-func (node ReplicaNodes) searchNode(db *MySQLDB) error {
-	dsn := db.monitorUser + ":" + db.monitorPass + "@(" + node.MasterHost + ":" + strconv.Itoa(node.MasterPort) + ")/"
-	sqlxDb, err := sqlx.Open("mysql", dsn)
+func (node ReplicaNode) searchNode(db *MySQLDB) error {
+	sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
 	if err != nil {
 		return err
 	}
@@ -87,43 +86,104 @@ func (node ReplicaNodes) searchNode(db *MySQLDB) error {
 		return err
 	}
 
-	newNode := ReplicaNodes{}
+	// if the node is treetop
+	if !rows.NextResultSet() {
+		n := db.replicaNodes[node.MasterUUID]
+		n.updateSelfInfo()
+		return nil
+	}
+
+	// if the node is not treetop
+	newNode := ReplicaNode{}
+	rows, err = sqlxDb.Unsafe().Queryx(showReplicaStatusQuery)
+	if err != nil {
+		return err
+	}
 	for rows.Next() {
 		if err = rows.StructScan(&newNode); err != nil {
 			return err
 		}
 		newNode.Level = node.Level + 1
+		newNode.Source = &node
 		db.replicaNodes[newNode.MasterUUID] = newNode
+		if err := newNode.updateDownstreamInfo(db); err != nil {
+			return err
+		}
+
+		// recursive search
+		if err := newNode.searchNode(db); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
-// gatherReplicaNodeses update replStatus of MySQLDB
-func (db *MySQLDB) gatherReplicaStatus() error {
-	sqlxDb := sqlx.NewDb(db.dbh, "mysql")
+func (node ReplicaNode) updateSelfInfo() error {
+	return nil
+}
 
-	rows, err := sqlxDb.Unsafe().Queryx(showReplicaStatusQuery)
+func (node ReplicaNode) DB(monitorUser string, monitorPass string) (*sqlx.DB, error) {
+	dsn := monitorUser + ":" + monitorPass + "@(" + node.MasterHost + ":" + strconv.Itoa(node.MasterPort) + ")/"
+	return sqlx.Open("mysql", dsn)
+}
+
+func (node ReplicaNode) updateDownstreamInfo(db *MySQLDB) error {
+	// collect replication node info
+	sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
 	if err != nil {
 		return err
 	}
+	defer sqlxDb.Close()
 
-	node := ReplicaNodes{}
+	rows, err := sqlxDb.Unsafe().Queryx(showReplicaHostQuery)
+	if err != nil {
+		return err
+	}
+	server := MySQLServerInfo{}
 	for rows.Next() {
-		if err = rows.StructScan(&node); err != nil {
+		if err = rows.StructScan(&server); err != nil {
 			return err
 		}
-		node.Level = 1
-		db.replicaNodes[node.MasterUUID] = node
+		if val, ok := db.replicaNodes[server.ServerUuid]; ok {
+			val.Info = server
+		} else {
+			node := ReplicaNode{}
+			node.Info = server
+			db.replicaNodes[server.ServerUuid] = node
+		}
 	}
-	db.executedGtidSet = node.ExecutedGtidSet
 
+	return nil
+}
+
+// gatherReplicaNodeses update replStatus of MySQLDB
+func (db *MySQLDB) gatherReplicaStatus() error {
+	node := ReplicaNode{}
+	if _, ok := db.replicaNodes[db.serverUuid]; !ok {
+		node.Level = 0
+		if err := node.updateSelfInfo(); err != nil {
+			return err
+		}
+		db.replicaNodes[db.serverUuid] = node
+	}
+
+	if err := node.searchNode(db); err != nil {
+		return err
+	}
+
+	for _, node := range db.replicaNodes {
+		if node.Level == 1 {
+			db.executedGtidSet = node.ExecutedGtidSet
+			break
+		}
+	}
 	return nil
 }
 
 // function autoPosition check whether auto position is enabled for all the channel
 func (db *MySQLDB) autoPosition() bool {
 	for _, node := range db.replicaNodes {
-		if node.Level == 1 && !node.AutoPosition {
+		if node.Level == 2 && !node.AutoPosition {
 			return false
 		}
 	}
@@ -153,35 +213,20 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 	var errantGtidSets string
 	var executedGtidSets []string
 	for _, node := range db.replicaNodes {
-		// connect to maser
-		dsn := db.monitorUser + ":" + db.monitorPass + "@(" + node.MasterHost + ":" + strconv.Itoa(node.MasterPort) + ")/"
-		sqlxDb, err := sqlx.Open("mysql", dsn)
-		if err != nil {
-			return errantGtidSets, err
-		}
-		defer sqlxDb.Close()
-
-		// replication node info
-		rows, err := sqlxDb.Unsafe().Queryx(showReplicaHostQuery)
-		if err != nil {
-			return errantGtidSets, err
-		}
-		server := MySQLServerInfo{}
-		for rows.Next() {
-			if err = rows.StructScan(&server); err != nil {
-				return errantGtidSets, err
+		if node.Level == 1 {
+			sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
+			if err != nil {
+				return "", err
 			}
-			n := db.replicaNodes[server.ServerUuid]
-			n.Info = server
-		}
+			defer sqlxDb.Close()
 
-		// gtid_executed
-		if err := sqlxDb.QueryRowx(getGTIDExecutedQuery).Scan(&node.GtidExecuted); err != nil {
-			return errantGtidSets, err
+			// gtid_executed
+			if err := sqlxDb.QueryRowx(getGTIDExecutedQuery).Scan(&node.GtidExecuted); err != nil {
+				return "", err
+			}
+			executedGtidSets = append(executedGtidSets, node.GtidExecuted)
 		}
-		executedGtidSets = append(executedGtidSets, node.GtidExecuted)
 	}
-	// TODO:
 	replicaGtidSets := strings.Replace(db.executedGtidSet, "\n", "", -1)
 	masterGtidSets := strings.Join(executedGtidSets, ",")
 	sqlxDb := sqlx.NewDb(db.dbh, "mysql")
