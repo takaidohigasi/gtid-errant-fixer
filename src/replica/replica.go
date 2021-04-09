@@ -75,11 +75,15 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 }
 
 func (node ReplicaNode) searchNode(db *MySQLDB) error {
-	sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
-	if err != nil {
-		return err
+	if node.MasterHost == "" {
+		sqlxDb := sqlx.NewDb(db.dbh, "mysql")
+	} else {
+		sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
+		if err != nil {
+			return err
+		}
+		defer sqlxDb.Close()
 	}
-	defer sqlxDb.Close()
 
 	rows, err := sqlxDb.Unsafe().Queryx(showReplicaStatusQuery)
 	if err != nil {
@@ -161,6 +165,7 @@ func (db *MySQLDB) gatherReplicaStatus() error {
 	node := ReplicaNode{}
 	if _, ok := db.replicaNodes[db.serverUuid]; !ok {
 		node.Level = 0
+		node.MasterUUID = db.serverUuid
 		if err := node.updateSelfInfo(); err != nil {
 			return err
 		}
