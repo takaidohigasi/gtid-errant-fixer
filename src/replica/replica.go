@@ -75,8 +75,10 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 }
 
 func (node ReplicaNode) searchNode(db *MySQLDB) error {
+	var sqlxDb *sqlx.DB
+
 	if node.MasterHost == "" {
-		sqlxDb := sqlx.NewDb(db.dbh, "mysql")
+		sqlxDb = sqlx.NewDb(db.dbh, "mysql")
 	} else {
 		sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
 		if err != nil {
