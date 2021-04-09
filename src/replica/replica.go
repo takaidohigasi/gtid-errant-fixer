@@ -9,8 +9,7 @@ import (
 
 	"github.com/Songmu/prompter"
 	"github.com/jmoiron/sqlx"
-
-	"github.com/k0kubun/pp"
+	// "github.com/k0kubun/pp"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -80,7 +79,7 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 	}, nil
 }
 
-func (node ReplicaNode) searchNode(db *MySQLDB) error {
+func (node *ReplicaNode) searchNode(db *MySQLDB) error {
 	var sqlxDb *sqlx.DB
 	var err error
 
@@ -103,7 +102,7 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	if !rows.Next() {
 		node.updateSelfInfo(sqlxDb)
 		node.TreeTop = true
-		db.treeTops[node.MasterUUID] = &node
+		db.treeTops[node.MasterUUID] = node
 		return nil
 	}
 
@@ -117,10 +116,10 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 		if err = rows.StructScan(&newNode); err != nil {
 			return err
 		}
-		db.replicaNodes[newNode.MasterUUID] = newNode
 		newNode.TreeTop = false
 		newNode.Level = node.Level + 1
-		newNode.Replica = &node
+		newNode.Replica = node
+		db.replicaNodes[newNode.MasterUUID] = newNode
 		if err := newNode.updateDownstreamInfo(db); err != nil {
 			return err
 		}
@@ -133,7 +132,7 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	return nil
 }
 
-func (node ReplicaNode) updateSelfInfo(sqlxDb *sqlx.DB) error {
+func (node *ReplicaNode) updateSelfInfo(sqlxDb *sqlx.DB) error {
 	server := &MySQLServerInfo{}
 	if err := sqlxDb.QueryRow(getSelfInfoQuery).Scan(&server.Host, &server.ServerId, &server.ServerUuid); err != nil {
 		return err
@@ -166,7 +165,6 @@ func (node ReplicaNode) updateDownstreamInfo(db *MySQLDB) error {
 		}
 		db.replicaNodes[server.ServerUuid].Info = server
 	}
-
 	return nil
 }
 
@@ -196,7 +194,7 @@ func (db *MySQLDB) gatherReplicaStatus() error {
 }
 
 // function autoPosition check whether auto position is enabled for all the channel
-func (db *MySQLDB) autoPosition() bool {
+func (db MySQLDB) autoPosition() bool {
 	for _, node := range db.replicaNodes {
 		if node.Level == 1 && !node.AutoPosition {
 			return false
@@ -205,23 +203,25 @@ func (db *MySQLDB) autoPosition() bool {
 	return true
 }
 
-func (db *MySQLDB) stopReplica() error {
-	fmt.Println("stopping replica")
+func (db MySQLDB) stopReplica() error {
+	fmt.Print("stopping replica")
 	if _, err := db.dbh.Exec(stopReplicaQuery); err != nil {
 		return err
 	}
+	fmt.Println(": done")
 	return nil
 }
 
-func (db *MySQLDB) resumeReplica() error {
-	fmt.Println("resuming replica")
+func (db MySQLDB) resumeReplica() error {
+	fmt.Print("resuming replica")
 	if _, err := db.dbh.Exec(startReplicaQuery); err != nil {
 		return err
 	}
+	fmt.Println(": done")
 	return nil
 }
 
-func (db *MySQLDB) errantTransaction() (string, error) {
+func (db MySQLDB) errantTransaction() (string, error) {
 	fmt.Println("errant transaction pre-check: ")
 
 	var errantGtidSets string
@@ -235,10 +235,12 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 			defer sqlxDb.Close()
 
 			// gtid_executed
-			if err := sqlxDb.QueryRowx(getGTIDExecutedQuery).Scan(&node.GtidExecuted); err != nil {
+			var gtidExecuted string
+			if err := sqlxDb.QueryRowx(getGTIDExecutedQuery).Scan(&gtidExecuted); err != nil {
 				return "", err
 			}
-			executedGtidSets = append(executedGtidSets, node.GtidExecuted)
+			db.replicaNodes[node.MasterUUID].GtidExecuted = gtidExecuted
+			executedGtidSets = append(executedGtidSets, gtidExecuted)
 		}
 	}
 	replicaGtidSets := strings.Replace(db.executedGtidSet, "\n", "", -1)
@@ -259,20 +261,17 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 	return errantGtidSets, nil
 }
 
-func (db *MySQLDB) InjectEmptyGTID(errantGTIDSets string) error {
+func (db MySQLDB) InjectEmptyGTID(errantGTIDSets string) error {
 	fmt.Println("candidate master to inject GTIDs:")
 
-	pp.Print(db.treeTops)
-
 	for _, master := range db.treeTops {
-		// fmt.Printf(" %s \n", master.Info.Host)
-		fmt.Printf("channel: %s", master.Replica.ChannelName)
-		// fmt.Printf(" %s (channel: %s, server_uuid: %s)\n", master.Info.Host, master.Replica.ChannelName, master.Info.ServerUuid)
+		fmt.Printf(" %s (channel: %s, server_uuid: %s)\n", master.Info.Host, master.Replica.ChannelName, master.Info.ServerUuid)
 	}
+
 	return nil
 }
 
-func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
+func (db MySQLDB) FixErrantGTID(forceOption bool) error {
 	if err := db.gatherReplicaStatus(); err != nil {
 		return err
 	}
@@ -301,7 +300,7 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 
 	// print original state just in case
 	executedGtidSet := db.executedGtidSet
-	fmt.Printf("original gtid_executed: \n%s\n", executedGtidSet)
+	fmt.Printf("\noriginal gtid_executed: \n%s\n", executedGtidSet)
 	gtidSet := strings.Split(executedGtidSet, ",")
 
 	var gtidPurged []string
@@ -318,6 +317,11 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 		}
 	}
 
+	fmt.Println("\ncandidate master to inject GTIDs:")
+	for _, master := range db.treeTops {
+		fmt.Printf(" - %s (channel: %s, server_uuid: %s)\n", master.Info.Host, master.ChannelName, master.Info.ServerUuid)
+	}
+
 	if !forceOption && !prompter.YN("\nWould you continue to reset?", false) {
 		fmt.Println("do nothing")
 		return nil
@@ -326,17 +330,19 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 		return err
 	}
 
-	fmt.Println(resetReplicaQuery)
-	if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
-		return err
-	}
-	fmt.Println(resetMasterQuery)
-	if _, err := db.dbh.Exec(resetMasterQuery); err != nil {
-		return err
-	}
-	fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
-	if _, err := db.dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
-		return err
-	}
+	/*
+		fmt.Println(resetReplicaQuery)
+		if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
+			return err
+		}
+		fmt.Println(resetMasterQuery)
+		if _, err := db.dbh.Exec(resetMasterQuery); err != nil {
+			return err
+		}
+		fmt.Println(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ",")))
+		if _, err := db.dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
+			return err
+		}
+	*/
 	return nil
 }
