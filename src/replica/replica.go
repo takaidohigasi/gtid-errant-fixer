@@ -77,7 +77,7 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	var sqlxDb *sqlx.DB
 
-	if node.MasterHost == "" {
+	if node.Level == 0 {
 		sqlxDb = sqlx.NewDb(db.dbh, "mysql")
 	} else {
 		sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
@@ -121,9 +121,10 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 			return err
 		}
 	}
-
 	return nil
 }
+
+
 func (node ReplicaNode) updateSelfInfo() error {
 	return nil
 }
@@ -158,7 +159,6 @@ func (node ReplicaNode) updateDownstreamInfo(db *MySQLDB) error {
 			db.replicaNodes[server.ServerUuid] = node
 		}
 	}
-
 	return nil
 }
 
@@ -202,7 +202,6 @@ func (db *MySQLDB) stopReplica() error {
 	if _, err := db.dbh.Exec(stopReplicaQuery); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -221,6 +220,7 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 	var executedGtidSets []string
 	for _, node := range db.replicaNodes {
 		if node.Level == 1 {
+			fmt.Printf("checking %s\n", node.MasterHost)
 			sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
 			if err != nil {
 				return "", err
@@ -249,7 +249,6 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 		}
 	}
 	fmt.Println("")
-
 	return errantGtidSets, nil
 }
 
@@ -315,6 +314,5 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 	if _, err := db.dbh.Exec(fmt.Sprintf(setGtidPurgedQuery, strings.Join(gtidPurged, ","))); err != nil {
 		return err
 	}
-
 	return nil
 }
