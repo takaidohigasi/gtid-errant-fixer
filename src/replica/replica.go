@@ -10,6 +10,8 @@ import (
 	"github.com/Songmu/prompter"
 	"github.com/jmoiron/sqlx"
 
+	"github.com/k0kubun/pp"
+
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -19,9 +21,10 @@ type (
 		ChannelName       string `db:"Channel_Name"`
 		ExecutedGtidSet   string `db:"Executed_Gtid_Set"`
 		GtidExecuted      string // @@gtid_executed
-		Info              MySQLServerInfo
+		Info              *MySQLServerInfo
 		Level             int
-		Source            *ReplicaNode
+		Replica           *ReplicaNode
+		TreeTop           bool
 		MasterHost        string `db:"Master_Host"`
 		MasterPort        int    `db:"Master_Port"`
 		MasterUUID        string `db:"Master_UUID"`
@@ -34,8 +37,9 @@ type (
 		executedGtidSet string
 		monitorUser     string
 		monitorPass     string
-		replicaNodes    map[string]ReplicaNode
+		replicaNodes    map[string]*ReplicaNode
 		serverUuid      string
+		treeTops        map[string]*ReplicaNode
 	}
 
 	MySQLServerInfo struct {
@@ -52,6 +56,7 @@ const (
 	getErrantGTIDsQuery    = `SELECT GTID_SUBTRACT('%s', '%s')`
 	getGTIDExecutedQuery   = `SELECT @@global.gtid_executed`
 	getServerUuidQuery     = `SELECT @@server_uuid`
+	getSelfInfoQuery       = `SELECT @@report_host, @@server_id, @@server_uuid`
 	setGtidPurgedQuery     = `SET GLOBAL gtid_purged='%s'`
 	showReplicaHostQuery   = `SHOW SLAVE HOSTS`
 	showReplicaStatusQuery = `SHOW SLAVE STATUS`
@@ -69,18 +74,20 @@ func NewMySQLDB(db *sql.DB, monitorUser string, monitorPass string) (*MySQLDB, e
 		"",
 		monitorUser,
 		monitorPass,
-		map[string]ReplicaNode{},
+		map[string]*ReplicaNode{},
 		serverUuid,
+		map[string]*ReplicaNode{},
 	}, nil
 }
 
 func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	var sqlxDb *sqlx.DB
+	var err error
 
 	if node.Level == 0 {
 		sqlxDb = sqlx.NewDb(db.dbh, "mysql")
 	} else {
-		sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
+		sqlxDb, err = node.DB(db.monitorUser, db.monitorPass)
 		if err != nil {
 			return err
 		}
@@ -93,25 +100,27 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	}
 
 	// if the node is treetop
-	if !rows.NextResultSet() {
-		n := db.replicaNodes[node.MasterUUID]
-		n.updateSelfInfo()
+	if !rows.Next() {
+		node.updateSelfInfo(sqlxDb)
+		node.TreeTop = true
+		db.treeTops[node.MasterUUID] = &node
 		return nil
 	}
 
 	// if the node is not treetop
-	newNode := ReplicaNode{}
 	rows, err = sqlxDb.Unsafe().Queryx(showReplicaStatusQuery)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
+		newNode := &ReplicaNode{}
 		if err = rows.StructScan(&newNode); err != nil {
 			return err
 		}
-		newNode.Level = node.Level + 1
-		newNode.Source = &node
 		db.replicaNodes[newNode.MasterUUID] = newNode
+		newNode.TreeTop = false
+		newNode.Level = node.Level + 1
+		newNode.Replica = &node
 		if err := newNode.updateDownstreamInfo(db); err != nil {
 			return err
 		}
@@ -124,7 +133,12 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	return nil
 }
 
-func (node ReplicaNode) updateSelfInfo() error {
+func (node ReplicaNode) updateSelfInfo(sqlxDb *sqlx.DB) error {
+	server := &MySQLServerInfo{}
+	if err := sqlxDb.QueryRow(getSelfInfoQuery).Scan(&server.Host, &server.ServerId, &server.ServerUuid); err != nil {
+		return err
+	}
+	node.Info = server
 	return nil
 }
 
@@ -145,29 +159,24 @@ func (node ReplicaNode) updateDownstreamInfo(db *MySQLDB) error {
 	if err != nil {
 		return err
 	}
-	server := MySQLServerInfo{}
 	for rows.Next() {
-		if err = rows.StructScan(&server); err != nil {
+		server := &MySQLServerInfo{}
+		if err = rows.StructScan(server); err != nil {
 			return err
 		}
-		if val, ok := db.replicaNodes[server.ServerUuid]; ok {
-			val.Info = server
-		} else {
-			node := ReplicaNode{}
-			node.Info = server
-			db.replicaNodes[server.ServerUuid] = node
-		}
+		db.replicaNodes[server.ServerUuid].Info = server
 	}
+
 	return nil
 }
 
 // gatherReplicaNodeses update replStatus of MySQLDB
 func (db *MySQLDB) gatherReplicaStatus() error {
-	node := ReplicaNode{}
+	node := &ReplicaNode{}
 	if _, ok := db.replicaNodes[db.serverUuid]; !ok {
 		node.Level = 0
 		node.MasterUUID = db.serverUuid
-		if err := node.updateSelfInfo(); err != nil {
+		if err := node.updateSelfInfo(sqlx.NewDb(db.dbh, "mysql")); err != nil {
 			return err
 		}
 		db.replicaNodes[db.serverUuid] = node
@@ -189,7 +198,7 @@ func (db *MySQLDB) gatherReplicaStatus() error {
 // function autoPosition check whether auto position is enabled for all the channel
 func (db *MySQLDB) autoPosition() bool {
 	for _, node := range db.replicaNodes {
-		if node.Level == 2 && !node.AutoPosition {
+		if node.Level == 1 && !node.AutoPosition {
 			return false
 		}
 	}
@@ -219,7 +228,6 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 	var executedGtidSets []string
 	for _, node := range db.replicaNodes {
 		if node.Level == 1 {
-			fmt.Printf("checking %s\n", node.MasterHost)
 			sqlxDb, err := node.DB(db.monitorUser, db.monitorPass)
 			if err != nil {
 				return "", err
@@ -249,6 +257,19 @@ func (db *MySQLDB) errantTransaction() (string, error) {
 	}
 	fmt.Println("")
 	return errantGtidSets, nil
+}
+
+func (db *MySQLDB) InjectEmptyGTID(errantGTIDSets string) error {
+	fmt.Println("candidate master to inject GTIDs:")
+
+	pp.Print(db.treeTops)
+
+	for _, master := range db.treeTops {
+		// fmt.Printf(" %s \n", master.Info.Host)
+		fmt.Printf("channel: %s", master.Replica.ChannelName)
+		// fmt.Printf(" %s (channel: %s, server_uuid: %s)\n", master.Info.Host, master.Replica.ChannelName, master.Info.ServerUuid)
+	}
+	return nil
 }
 
 func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
@@ -301,6 +322,10 @@ func (db *MySQLDB) FixErrantGTID(forceOption bool) error {
 		fmt.Println("do nothing")
 		return nil
 	}
+	if err := db.InjectEmptyGTID(errantGtidSets); err != nil {
+		return err
+	}
+
 	fmt.Println(resetReplicaQuery)
 	if _, err := db.dbh.Exec(resetReplicaQuery); err != nil {
 		return err

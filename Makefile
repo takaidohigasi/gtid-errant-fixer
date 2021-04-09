@@ -12,7 +12,7 @@ dep:
 
 .PHONY: linux
 linux:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINNAME) main.go
+	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o bin/$(BINNAME) main.go
 
 .PHONY: build
 build:
