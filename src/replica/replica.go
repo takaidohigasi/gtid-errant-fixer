@@ -124,7 +124,6 @@ func (node ReplicaNode) searchNode(db *MySQLDB) error {
 	return nil
 }
 
-
 func (node ReplicaNode) updateSelfInfo() error {
 	return nil
 }
